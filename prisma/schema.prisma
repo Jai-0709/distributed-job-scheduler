@@ -1,0 +1,304 @@
+// This is the Prisma schema for the distributed job scheduler.
+// Cascade rule applied consistently throughout:
+//   - Logs/executions/heartbeats only make sense tied to their parent → onDelete: Cascade
+//   - Anything that would silently delete a person's org, project, queue, or job as a
+//     side effect of something else → onDelete: Restrict (forces an explicit action)
+// See docs/design-decisions.md for the full rationale.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  ADMIN
+  MEMBER
+}
+
+enum RetryStrategy {
+  FIXED
+  LINEAR
+  EXPONENTIAL
+}
+
+enum JobStatus {
+  QUEUED
+  SCHEDULED
+  CLAIMED
+  RUNNING
+  COMPLETED
+  FAILED
+  DEAD_LETTER
+}
+
+enum ExecutionStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+enum WorkerStatus {
+  ONLINE
+  OFFLINE
+  DRAINING
+}
+
+enum LogLevel {
+  INFO
+  WARN
+  ERROR
+}
+
+// ─── Models ──────────────────────────────────────────────────────────────────
+
+model Organization {
+  id        String    @id @default(cuid())
+  name      String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime? // soft delete — orgs are never hard-deleted for audit reasons
+
+  users    User[]
+  projects Project[]
+}
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String
+  name         String
+  role         UserRole  @default(MEMBER)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  // Restrict: never silently delete a user's org — force an explicit action
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+}
+
+model Project {
+  id          String    @id @default(cuid())
+  name        String
+  description String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+
+  queues Queue[]
+
+  @@unique([organizationId, name])
+}
+
+model RetryPolicy {
+  id          String        @id @default(cuid())
+  name        String
+  strategy    RetryStrategy
+  maxRetries  Int
+  baseDelayMs Int
+  maxDelayMs  Int
+  multiplier  Float
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  // Reusable — can be attached to a Queue as default or overridden per Job
+  queues Queue[]
+  jobs   Job[]
+}
+
+model Queue {
+  id               String    @id @default(cuid())
+  name             String
+  concurrencyLimit Int       @default(10)
+  isPaused         Boolean   @default(false)
+  rateLimitPerSec  Int? // nullable hook for future rate limiting (not enforced in claim loop — see design-decisions.md)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  deletedAt        DateTime?
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Restrict)
+
+  defaultRetryPolicyId String?
+  defaultRetryPolicy   RetryPolicy? @relation(fields: [defaultRetryPolicyId], references: [id], onDelete: SetNull)
+
+  jobs          Job[]
+  scheduledJobs ScheduledJob[]
+
+  @@unique([projectId, name])
+}
+
+model Job {
+  id String @id @default(cuid())
+
+  // Core identity
+  type     String
+  payload  Json
+  status   JobStatus @default(QUEUED)
+  priority Int       @default(0) // higher = claimed first
+
+  // Idempotency: composite unique on (queueId, idempotencyKey) ensures duplicate
+  // submissions from clients are safe to retry — the server returns the existing job.
+  idempotencyKey String?
+
+  // Scheduling: defaults to now() for immediate jobs; future timestamp for delayed/scheduled
+  runAt DateTime @default(now())
+
+  // Retry tracking
+  retryCount         Int     @default(0)
+  maxRetries         Int     @default(3)
+  lastFailureReason  String?
+
+  // Execution tracking
+  claimedByWorkerId String?
+  claimedAt         DateTime?
+  startedAt         DateTime?
+  completedAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Restrict: a job references its queue; deleting the queue must be explicit
+  queueId String
+  queue   Queue  @relation(fields: [queueId], references: [id], onDelete: Restrict)
+
+  retryPolicyId String?
+  retryPolicy   RetryPolicy? @relation(fields: [retryPolicyId], references: [id], onDelete: SetNull)
+
+  // Cascade: executions, logs are meaningless without their job
+  executions  JobExecution[]
+  logs        JobLog[]
+  deadLetter  DeadLetterQueue?
+
+  // Composite unique: makes duplicate idempotencyKey submissions safe within a queue
+  @@unique([queueId, idempotencyKey])
+
+  // Critical index: this is exactly what the claim query filters and sorts on.
+  // Without this, Postgres would full-scan the Job table on every poll cycle.
+  // Justification in docs/design-decisions.md.
+  @@index([queueId, status, runAt])
+}
+
+model JobExecution {
+  id            String          @id @default(cuid())
+  attemptNumber Int
+  status        ExecutionStatus
+  startedAt     DateTime
+  finishedAt    DateTime?
+  durationMs    Int?
+  errorMessage  String?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  // Cascade: execution record is meaningless without its job
+  jobId String
+  job   Job    @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  // SetNull: worker can be deleted/replaced without losing execution history
+  workerId String?
+  worker   Worker? @relation(fields: [workerId], references: [id], onDelete: SetNull)
+
+  logs JobLog[]
+}
+
+model Worker {
+  id          String       @id @default(cuid())
+  hostname    String
+  pid         Int
+  status      WorkerStatus @default(ONLINE)
+  concurrency Int
+  currentLoad Int          @default(0)
+  registeredAt DateTime    @default(now())
+  lastSeenAt  DateTime     @default(now())
+
+  // Cascade: heartbeats only make sense tied to their worker
+  heartbeats WorkerHeartbeat[]
+  executions JobExecution[]
+}
+
+model WorkerHeartbeat {
+  id         String   @id @default(cuid())
+  timestamp  DateTime @default(now())
+  activeJobs Int
+  cpuLoad    Float?
+  memoryMb   Float?
+
+  // Cascade: heartbeat log is meaningless without the worker
+  workerId String
+  worker   Worker @relation(fields: [workerId], references: [id], onDelete: Cascade)
+
+  @@index([workerId, timestamp])
+}
+
+model JobLog {
+  id        String   @id @default(cuid())
+  level     LogLevel
+  message   String
+  meta      Json?
+  createdAt DateTime @default(now())
+
+  // Cascade: log lines are meaningless without their job
+  jobId String
+  job   Job    @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  // SetNull: we still want the log even if the execution record is gone
+  executionId String?
+  execution   JobExecution? @relation(fields: [executionId], references: [id], onDelete: SetNull)
+
+  @@index([jobId, createdAt])
+}
+
+model ScheduledJob {
+  id              String   @id @default(cuid())
+  name            String
+  cronExpression  String
+  jobType         String
+  payloadTemplate Json
+  isActive        Boolean  @default(true)
+  lastRunAt       DateTime?
+  nextRunAt       DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Cascade: scheduled templates only make sense within their queue context
+  queueId String
+  queue   Queue  @relation(fields: [queueId], references: [id], onDelete: Cascade)
+
+  // Critical index: the scheduler polls this exact filter
+  @@index([isActive, nextRunAt])
+}
+
+model DeadLetterQueue {
+  id String @id @default(cuid())
+
+  queueId String
+
+  // payloadSnapshot is an IMMUTABLE COPY of the payload at failure time.
+  // Not a live reference — forensic inspection must survive even if Job is later purged.
+  payloadSnapshot Json
+
+  reason           String
+  failedAt         DateTime
+  retriedFromDlqAt DateTime?
+  createdAt        DateTime  @default(now())
+
+  // Cascade: DLQ record is meaningless without its job
+  // Unique: one DLQ record per job
+  jobId String @unique
+  job   Job    @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  // The queue field is denormalized for fast DLQ listing by queue.
+  // We store queueId as a plain string (not a FK relation with onDelete)
+  // since it's already constrained by Job.queueId.
+
+  @@index([queueId])
+}
