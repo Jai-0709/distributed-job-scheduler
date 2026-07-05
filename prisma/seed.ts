@@ -13,7 +13,13 @@ import { parseExpression } from 'cron-parser';
 const prisma = new PrismaClient();
 
 async function main() {
-  console.log('🌱 Seeding database...');
+  console.log(' Seeding database...');
+
+  // Clean up existing jobs to allow re-seeding safely
+  await prisma.jobLog.deleteMany({});
+  await prisma.jobExecution.deleteMany({});
+  await prisma.deadLetterQueue.deleteMany({});
+  await prisma.job.deleteMany({});
 
   // ── Organization ─────────────────────────────────────────────────────────
   const org = await prisma.organization.upsert({
@@ -24,7 +30,7 @@ async function main() {
       name: 'Demo Organization',
     },
   });
-  console.log(`✓ Organization: ${org.name}`);
+  console.log(` Organization: ${org.name}`);
 
   // ── Admin User ───────────────────────────────────────────────────────────
   const passwordHash = await bcrypt.hash('password123', 10);
@@ -40,7 +46,7 @@ async function main() {
       organizationId: org.id,
     },
   });
-  console.log(`✓ Admin user: ${adminUser.email}`);
+  console.log(` Admin user: ${adminUser.email}`);
 
   // ── Member User ──────────────────────────────────────────────────────────
   const memberPasswordHash = await bcrypt.hash('member123', 10);
@@ -56,7 +62,7 @@ async function main() {
       organizationId: org.id,
     },
   });
-  console.log(`✓ Member user: member@demo.com`);
+  console.log(` Member user: member@demo.com`);
 
   // ── Project ──────────────────────────────────────────────────────────────
   const project = await prisma.project.upsert({
@@ -69,7 +75,7 @@ async function main() {
       organizationId: org.id,
     },
   });
-  console.log(`✓ Project: ${project.name}`);
+  console.log(` Project: ${project.name}`);
 
   // ── Retry Policies ───────────────────────────────────────────────────────
   const exponentialRetryPolicy = await prisma.retryPolicy.upsert({
@@ -99,7 +105,7 @@ async function main() {
       multiplier: 1.0,
     },
   });
-  console.log(`✓ Retry policies: exponential + fixed`);
+  console.log(` Retry policies: exponential + fixed`);
 
   // ── Queue ────────────────────────────────────────────────────────────────
   const queue = await prisma.queue.upsert({
@@ -127,7 +133,7 @@ async function main() {
       defaultRetryPolicyId: fixedRetryPolicy.id,
     },
   });
-  console.log(`✓ Queues: default + email`);
+  console.log(` Queues: default + email`);
 
   // ── Demo Jobs ────────────────────────────────────────────────────────────
   // Mix of job types:
@@ -304,7 +310,7 @@ async function main() {
     });
     jobCount++;
   }
-  console.log(`✓ Demo jobs: ${jobCount} created`);
+  console.log(` Demo jobs: ${jobCount} created`);
 
   // ── Scheduled Job (cron template) ────────────────────────────────────────
   // The scheduler process reads this and materializes real Job rows when due.
@@ -331,15 +337,15 @@ async function main() {
       queueId: queue.id,
     },
   });
-  console.log(`✓ ScheduledJob: "Minutely Health Check" (cron: ${cronExpr})`);
+  console.log(` ScheduledJob: "Minutely Health Check" (cron: ${cronExpr})`);
 
-  console.log('\n✅ Seed complete!');
+  console.log('\n Seed complete!');
   console.log('   Login: admin@demo.com / password123');
 }
 
 main()
   .catch((e) => {
-    console.error('❌ Seed failed:', e);
+    console.error(' Seed failed:', e);
     process.exit(1);
   })
   .finally(async () => {
